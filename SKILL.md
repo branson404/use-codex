@@ -11,7 +11,8 @@ Claude plans and reviews. Codex does the typing. A runner enforces the plan.
 - Tiny job (a one-line fix, a single read)? Do it yourself; Codex has startup cost.
 - `python3 ~/.claude/skills/use-codex/scripts/codex_run.py check TODO PROJECT` prints `login: present|MISSING`.
   If Codex answers `refresh token was revoked`, stop and tell the user to run `! codex login` (interactive; you cannot).
-- Docker must work (`docker ps`). Image default `python:3.12-slim` has no git/node; set `image:` if needed.
+- Only hard requirements: Codex CLI installed + logged in, macOS or Linux. `backend: auto` uses Docker when it works on Linux, else the
+  `local` backend (Codex's own sandbox on a scratch copy). Docker image default `python:3.12-slim` has no git/node; set `image:` if needed.
 
 ## 1. Write the TODO (this is where usage is saved or wasted)
 Copy `templates/TODO.template.md`. Rules:
@@ -34,8 +35,9 @@ newest listed model in `~/.codex/models_cache.json`.
 ```
 python3 ~/.claude/skills/use-codex/scripts/codex_run.py start TODO PROJECT      # run_in_background: true
 ```
-The runner starts a container (`--cap-drop ALL`, project mounted read-only, only `write:` paths writable, `.env`/keys blanked,
-login copy deleted afterwards) and checks every Codex event live. It prints one compact line per action and writes
+The runner confines Codex and checks every event live. `docker`: container (`--cap-drop ALL`, project read-only, only `write:` paths
+writable, `.env`/keys blanked, login copy deleted afterwards). `local`: Codex's native sandbox on a scratch copy; only `write:` paths
+are copied back, any other change is reverted and reported as a violation. It prints one compact line per action and writes
 `~/.cache/use-codex/<run>/summary.log`. You do not poll. Optionally attach a Monitor to
 `tail -F <run>/summary.log | grep --line-buffered -E 'VIOLATION|STALL|TIMEOUT|BUDGET|WARN|BLOCKED|RESULT'`.
 
@@ -66,9 +68,9 @@ killed: `codex_run.py cleanup <run>`. Runs live under `~/.cache/use-codex/`; del
 - Check `tokens=` on the RESULT line; if a job type is costly, lower effort or tighten the TODO next time.
 
 ## Known limits (be honest about them)
-- Network stays on (Codex needs its API). The monitor, not the network, blocks `curl`; a command that is allowlisted can still call out.
+- `local` is weaker than `docker` (it relies on Codex's own sandbox + the scratch copy) and a real macOS run has not been verified; on a Linux host that blocks user namespaces Codex's native sandbox cannot start, so use `docker` there.
+- `docker`: network stays on (Codex needs its API). The monitor, not the network, blocks `curl`; an allowlisted command can still call out. Codex's login sits in `/codexhome` in the container; reading it is blocked by the monitor, not the filesystem.
 - The policy parses shell text. It blocks `$(...)`, backticks and nested shells by design; unusual-but-legit commands may need a `run:` entry.
-- Codex's own login lives in `/codexhome` inside the container. Reading it is blocked by the monitor, not by the filesystem.
 - Codex rotates refresh tokens. The runner copies a refreshed login back to `~/.codex/auth.json` after each run; never copy auth files by hand.
 - `codex_run.py selftest` re-validates the policy engine offline. `--probe` on `start` verifies the container confinement without a model call.
 - Verified live (2026-11-21, codex-cli 0.170, gpt-6.2-sol): a real job ran end to end, `BLOCKED` -> `resume` -> `DONE` worked, files stayed inside `write:`, `.env` untouched, container and login copy removed. The monitor was also replayed on the real `events.jsonl` with stricter policies and flagged the right command/edit. Codex usually obeys the allowlist in its own prompt and prints `BLOCKED`, so the kill path is a backstop, not the common case.

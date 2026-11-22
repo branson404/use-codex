@@ -2,11 +2,14 @@ name: selftest
 on: [push, pull_request]
 jobs:
   selftest:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Offline policy-engine check: needs neither Codex nor Docker.
+      # Offline: policy engine, monitor, and the local backend with a stand-in codex. Needs neither Codex nor Docker.
       - run: python scripts/codex_run.py selftest

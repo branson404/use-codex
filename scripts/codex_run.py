@@ -13,7 +13,7 @@ and police every event against the TODO's allowlist. Stdlib only.
 
 Exit codes of start/resume: 0 done, 3 violation, 4 timeout/stall/budget, 5 codex failed/blocked.
 """
-import argparse, json, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time, secrets
+import argparse, filecmp, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, secrets
 from pathlib import Path
 
 RUNS = Path(os.environ.get("USE_CODEX_HOME", Path.home() / ".cache" / "use-codex"))
@@ -23,14 +23,18 @@ WORK = "/work"
 
 DEFAULTS = {"model": "sol", "effort": "high", "write": "", "run": "", "web": "no",
             "max-minutes": "30", "max-commands": "80", "stall-seconds": "300",
-            "image": "python:3.12-slim"}
+            "image": "python:3.12-slim", "backend": "auto"}
 READ_CMDS = {"ls", "cat", "rg", "grep", "egrep", "fgrep", "head", "tail", "wc", "find", "pwd",
              "echo", "printf", "diff", "stat", "file", "tree", "cd", "test", "[", "true", "false",
              "sort", "uniq", "cut", "tr", "basename", "dirname", "realpath", "sed", "awk", "which",
              "nl", "less", "cmp", "du", "readlink", "date", "seq", "xxd", "od", "jq"}
 GIT_READ = {"status", "diff", "log", "show", "ls-files", "rev-parse", "blame", "grep"}
 WRITE_CMDS = {"cp", "mv", "rm", "mkdir", "touch", "tee", "install", "ln", "chmod", "truncate", "rmdir"}
-OK_ABS = ("/usr", "/bin", "/lib", "/tmp", "/dev/null", "/dev/stderr", "/dev/stdout", "/proc/self")
+OK_ABS = ("/usr", "/bin", "/lib", "/tmp", "/dev/null", "/dev/stderr", "/dev/stdout", "/proc/self",
+          "/private/tmp", "/var/folders", "/private/var/folders", "/System/Library", "/opt/homebrew")
+TMP_PREFIXES = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", "/dev/null")
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+SECRET_RE = re.compile(r"\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_rsa.*|credentials(\.json)?|\.npmrc|\.netrc")
 
 
 # ---------------------------------------------------------------- TODO parsing
@@ -70,25 +74,25 @@ def resolve_model(alias):
 
 # ---------------------------------------------------------------- policy engine
 class Policy:
-    def __init__(self, cfg):
+    def __init__(self, cfg, root=WORK):
+        self.root = root
         self.writes = [self._norm(w) for w in cfg["write_list"]]
         self.run = cfg["run_list"]
         self.web = cfg["web"].lower() in ("yes", "true", "1")
 
-    @staticmethod
-    def _norm(p):
-        p = p.replace(WORK + "/", "", 1) if p.startswith(WORK + "/") else p
-        return os.path.normpath(os.path.join(WORK, p))
+    def _norm(self, p):
+        p = p.replace(self.root + "/", "", 1) if p.startswith(self.root + "/") else p
+        return os.path.normpath(os.path.join(self.root, p))
 
     def writable(self, p):
         p = self._norm(p)
-        if p.startswith(("/tmp/", "/dev/null")) or p in ("/tmp", "/dev/null", "/dev/stderr", "/dev/stdout"):
-            return True
-        return any(p == w or p.startswith(w + "/") for w in self.writes)
+        if p == self.root or p.startswith(self.root + "/"):  # scope check first: the root may itself live under /tmp
+            return any(p == w or p.startswith(w + "/") for w in self.writes)
+        return p.startswith(TMP_PREFIXES) or p in ("/tmp", "/dev/null", "/dev/stderr", "/dev/stdout")
 
     def readable(self, p):
         p = self._norm(p)
-        return p == WORK or p.startswith(WORK + "/") or any(p == a or p.startswith(a + "/") for a in OK_ABS)
+        return p == self.root or p.startswith(self.root + "/") or any(p == a or p.startswith(a + "/") for a in OK_ABS)
 
     # -- shell command analysis: returns None if allowed, else a reason string
     def check_command(self, command):
@@ -208,7 +212,7 @@ class Policy:
             bad = [p for p in paths if not self.writable(p)]
             if bad:
                 return "%s outside allowed write paths: %s" % (name, bad[0])
-            if name in ("rm", "rmdir") and any(self._norm(p) in self.writes or self._norm(p) == WORK for p in paths):
+            if name in ("rm", "rmdir") and any(self._norm(p) in self.writes or self._norm(p) == self.root for p in paths):
                 return "%s of a whole allowed root" % name
             return None
         if name in READ_CMDS:
@@ -336,7 +340,7 @@ def secret_files(project):
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in skip and len(Path(root, d).relative_to(base).parts) <= 3]
         for f in files:
-            if re.fullmatch(r"\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_rsa.*|credentials(\.json)?|\.npmrc|\.netrc", f):
+            if SECRET_RE.fullmatch(f):
                 hits.append(str(Path(root, f).relative_to(base)))
     return hits
 
@@ -422,6 +426,11 @@ def sync_auth_back(run_dir):
 def cleanup(run_id, quiet=False):
     run_dir = RUNS / run_id
     meta = json.loads((run_dir / "meta.json").read_text())
+    if meta.get("backend") == "local":
+        shutil.rmtree(meta["stage"], ignore_errors=True)
+        if not quiet:
+            print("cleaned %s (scratch copy removed)" % run_id)
+        return
     sh("docker", "rm", "-f", meta["container"])
     synced = sync_auth_back(run_dir)
     (run_dir / "home" / "auth.json").unlink(missing_ok=True)
@@ -438,24 +447,100 @@ def cleanup(run_id, quiet=False):
         print("cleaned %s (container removed, login copy deleted%s)" % (run_id, ", refreshed token synced to host" if synced else ""))
 
 
+def pick_backend(cfg):
+    b = cfg["backend"]
+    if b not in ("auto", "docker", "local"):
+        sys.exit("backend must be auto, docker or local")
+    try:
+        docker_ok = (sys.platform.startswith("linux") and bool(shutil.which("docker"))
+                     and sh("docker", "info", timeout=20).returncode == 0)
+    except (OSError, subprocess.TimeoutExpired):
+        docker_ok = False
+    if b == "docker" and not docker_ok:
+        sys.exit("backend docker needs Linux and a working Docker (the host codex binary is mounted into a Linux container)")
+    return b if b != "auto" else ("docker" if docker_ok else "local")
+
+
+def local_flags(meta, cfg):
+    """Host-native run: Codex's own sandbox (Seatbelt on macOS, bwrap on Linux), never danger-full-access."""
+    if meta.get("backend") != "local":
+        return []
+    return ["--ignore-user-config", "-c", 'approval_policy="never"', "-c", 'sandbox_mode="workspace-write"',
+            "-c", 'model_reasoning_effort="%s"' % cfg["effort"]]
+
+
+def copy_stage(project, stage):
+    """Scratch copy for the local backend: no .git, dependency dirs or secret files."""
+    shutil.copytree(project, stage, symlinks=True,
+                    ignore=lambda d, names: [n for n in names if n in SKIP_DIRS or SECRET_RE.fullmatch(n)])
+
+
+def _files(root):
+    out = {}
+    for r, dirs, fs in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        out.update({str(Path(r, f).relative_to(root)): Path(r, f) for f in fs if not SECRET_RE.fullmatch(f)})
+    return out
+
+
+def sync_back(project, stage, policy):
+    """Apply in-scope stage changes to the project; revert (and report) anything out of scope."""
+    old, new = _files(project), _files(stage)
+    applied, reverted = [], []
+    for rel in sorted(set(old) | set(new)):
+        a, b = old.get(rel), new.get(rel)
+        if a and b and filecmp.cmp(a, b, shallow=False):
+            continue
+        if policy.writable(rel):
+            if b:
+                (project / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(b, project / rel)
+            else:
+                a.unlink()
+            applied.append(rel)
+        else:
+            if a:
+                (stage / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(a, stage / rel)
+            else:
+                b.unlink()
+            reverted.append(rel)
+    return applied, reverted
+
+
 def execute(run_dir, meta, cfg, tail, probe=False):
-    policy = Policy(cfg)
+    local = meta.get("backend") == "local"
+    policy = Policy(cfg, root=meta["stage"] if local else WORK)
     log = run_dir / "summary.log"
     mon = Monitor(policy, cfg, log)
-    mounts = meta["mounts"] if meta.get("mounts_ready") else prepare_mounts(cfg, meta["project"], meta)
-    meta["mounts"], meta["mounts_ready"] = mounts, True
+    if local:
+        if not Path(meta["stage"]).exists():
+            copy_stage(meta["project"], meta["stage"])
+        cmd, popen_kw = tail, {"cwd": meta["stage"], "start_new_session": True}
+    else:
+        mounts = meta["mounts"] if meta.get("mounts_ready") else prepare_mounts(cfg, meta["project"], meta)
+        meta["mounts"], meta["mounts_ready"] = mounts, True
+        sh("docker", "rm", "-f", meta["container"])
+        cmd, popen_kw = docker_cmd(meta, cfg, mounts, tail), {}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=1))
-    sh("docker", "rm", "-f", meta["container"])
-    cmd = docker_cmd(meta, cfg, mounts, tail)
-    mon.say("RUN %s model=%s effort=%s image=%s write=%s" % (meta["id"], meta["model"], cfg["effort"], cfg["image"], cfg["write"] or "-"))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    mon.say("RUN %s backend=%s model=%s effort=%s write=%s" % (meta["id"], "local" if local else "docker:" + cfg["image"], meta["model"], cfg["effort"], cfg["write"] or "-"))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, **popen_kw)
+    if local:
+        meta["pid"] = proc.pid
+        (run_dir / "meta.json").write_text(json.dumps(meta, indent=1))
     state = {"reason": None}
     deadline = time.time() + float(cfg["max-minutes"]) * 60
 
     def kill(reason):
         if state["reason"] is None:
             state["reason"] = reason
-            sh("docker", "kill", meta["container"])
+            if local:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            else:
+                sh("docker", "kill", meta["container"])
 
     def watchdog():
         while proc.poll() is None:
@@ -479,6 +564,13 @@ def execute(run_dir, meta, cfg, tail, probe=False):
                 kill("VIOLATION")
                 break
     proc.wait()
+    applied, reverted = [], []
+    if local:
+        applied, reverted = sync_back(Path(meta["project"]), Path(meta["stage"]), policy)
+        mon.say("SYNC applied=%s reverted-out-of-scope=%s" % (applied or "-", reverted or "-"))
+        if reverted and not mon.violation:
+            mon.violation = "out-of-scope changes reverted: %s" % ", ".join(reverted[:5])
+            mon.say("VIOLATION %s" % mon.violation)
     if mon.raw_cmd_lines and not mon.commands:
         mon.say("WARN monitor parsed 0 commands but the stream has %d command events - event format changed? "
                 "Nothing was policed; read events.jsonl before trusting this run." % mon.raw_cmd_lines)
@@ -496,6 +588,7 @@ def execute(run_dir, meta, cfg, tail, probe=False):
     (run_dir / "last_message.md").write_text(mon.last_message)
     result = {"status": status, "violation": mon.violation or reason or None, "commands": mon.commands,
               "tokens_in": mon.tokens[0], "tokens_out": mon.tokens[1], "thread_id": meta.get("thread_id"),
+              "applied": applied, "reverted": reverted,
               "last_message": str(run_dir / "last_message.md"), "events": str(run_dir / "events.jsonl")}
     (run_dir / "result.json").write_text(json.dumps(result, indent=1))
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -510,13 +603,15 @@ def new_run(cfg, todo_path, project):
     run_dir.mkdir(parents=True)
     model = resolve_model(cfg["model"])
     shutil.copyfile(todo_path, run_dir / "TODO.md")
-    meta = {"id": run_id, "container": "cx-" + run_id, "project": str(Path(project).resolve()), "model": model}
-    write_home(run_dir, cfg, model)
+    meta = {"id": run_id, "container": "cx-" + run_id, "project": str(Path(project).resolve()), "model": model,
+            "backend": pick_backend(cfg), "stage": str((run_dir / "stage").resolve())}
+    if meta["backend"] == "docker":
+        write_home(run_dir, cfg, model)
     return run_id, run_dir, meta
 
 
 def prompt_for(cfg):
-    return ("You are executing a pre-approved TODO inside /work. Do the numbered steps exactly, in order, and nothing else. "
+    return ("You are executing a pre-approved TODO in your current directory (that is your whole world). Do the numbered steps exactly, in order, and nothing else. "
             "Writes are allowed ONLY in: %s. Shell commands allowed ONLY: read-only inspection (ls, cat, rg, sed -n, git status/diff) "
             "plus: %s. Anything else is blocked and ends the run. Do not explore beyond files the steps name. "
             "If a step cannot be done as written, print `BLOCKED: <reason>` and stop; do not improvise. "
@@ -545,6 +640,8 @@ def main():
         sub.add_parser(n).add_argument("run")
     sub.add_parser("selftest")
     a = ap.parse_args()
+    if sys.platform == "win32":
+        sys.exit("use-codex supports macOS and Linux (on Windows use WSL2)")
 
     if a.cmd == "selftest":
         return selftest()
@@ -552,9 +649,13 @@ def main():
         cfg = parse_todo(a.todo)
         if not Path(a.project).is_dir():
             sys.exit("project dir not found: %s" % a.project)
-        if not shutil.which("codex") or not shutil.which("docker"):
-            sys.exit("codex and docker must be on PATH")
+        backend = pick_backend(cfg)
+        if not shutil.which("codex"):
+            sys.exit("codex CLI not found on PATH (install it and run `codex login`)")
+        if a.probe and backend != "docker":
+            sys.exit("--probe tests the Docker confinement only")
         if a.cmd == "check":
+            print("backend=%s" % backend)
             print("model=%s effort=%s image=%s\nwrite=%s\nrun=%s\nsecrets masked: %s\nlimits: %sm / %s cmds / stall %ss"
                   % (resolve_model(cfg["model"]), cfg["effort"], cfg["image"], cfg["write_list"], cfg["run_list"],
                      secret_files(a.project), cfg["max-minutes"], cfg["max-commands"], cfg["stall-seconds"]))
@@ -569,7 +670,8 @@ def main():
                       "echo caps:; grep CapEff /proc/self/status; echo codexhome:; ls /codexhome 2>&1 | head -3") % dirs
             tail = ["sh", "-c", script]
         else:
-            tail = ["codex", "exec", "--json", "--skip-git-repo-check", "-C", WORK, "-m", meta["model"], prompt_for(cfg)]
+            tail = ["codex", "exec", "--json", "--skip-git-repo-check", *local_flags(meta, cfg),
+                    "-C", meta["stage"] if meta["backend"] == "local" else WORK, "-m", meta["model"], prompt_for(cfg)]
         print("run %s" % run_id, flush=True)
         return execute(run_dir, meta, cfg, tail, probe=a.probe)
     if a.cmd == "resume":
@@ -577,8 +679,9 @@ def main():
         cfg = parse_todo(run_dir / "TODO.md")
         if not meta.get("thread_id") and not a.probe:
             sys.exit("no thread_id recorded for %s - cannot resume" % a.run)
-        write_home(run_dir, cfg, meta["model"])
-        tail = ["codex", "exec", "resume", "--json", "--skip-git-repo-check", meta.get("thread_id", "x"),
+        if meta.get("backend", "docker") == "docker":
+            write_home(run_dir, cfg, meta["model"])
+        tail = ["codex", "exec", "resume", "--json", "--skip-git-repo-check", *local_flags(meta, cfg), meta.get("thread_id", "x"),
                 "Correction from the orchestrator: %s\nStay inside the same TODO limits. Continue from where you stopped." % a.message]
         return execute(run_dir, meta, cfg, tail, probe=a.probe)
     run_dir, meta = load_run(a.run)
@@ -586,8 +689,14 @@ def main():
         print((run_dir / "result.json").read_text() if (run_dir / "result.json").exists() else "running/unknown")
         print("".join(open(run_dir / "summary.log").readlines()[-8:]), end="")
     elif a.cmd == "stop":
-        sh("docker", "kill", meta["container"])
-        print("killed", meta["container"])
+        if meta.get("backend") == "local" and meta.get("pid"):
+            try:
+                os.killpg(meta["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        else:
+            sh("docker", "kill", meta["container"])
+        print("killed", meta["id"])
     elif a.cmd == "cleanup":
         cleanup(a.run)
     return 0
@@ -637,8 +746,56 @@ def selftest():
         fails += 1
         print("monitor state wrong", v, m.thread_id, m.done, m.tokens)
     os.unlink(log)
+    fails += selftest_local()
     print("selftest: %d ok-cases, %d bad-cases, %d failures" % (len(ok), len(bad), fails))
     return 1 if fails else 0
+
+
+FAKE_CODEX = """#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+cwd = a[a.index("-C") + 1] if "-C" in a else os.getcwd()
+ev = lambda o: print(json.dumps(o), flush=True)
+ev({"type": "thread.started", "thread_id": "t-fake"})
+assert not os.path.exists(os.path.join(cwd, ".env")), "secret leaked into the scratch copy"
+assert "--ignore-user-config" in a and 'sandbox_mode="workspace-write"' in a, "local flags missing"
+open(os.path.join(cwd, "src", "a.py"), "w").write("print(1)\\n")
+ev({"type": "item.completed", "item": {"id": "1", "type": "file_change",
+    "changes": [{"path": os.path.join(cwd, "src", "a.py"), "kind": "add"}]}})
+if os.environ.get("FAKE_TAMPER"):
+    open(os.path.join(cwd, "README.md"), "w").write("tampered\\n")  # hidden: never reported in the stream
+ev({"type": "item.completed", "item": {"id": "2", "type": "agent_message", "text": "DONE: ok"}})
+ev({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}})
+"""
+
+
+def selftest_local():
+    """End-to-end check of the host-native backend with a stand-in `codex` (no Codex, Docker or network)."""
+    fails, d = 0, Path(tempfile.mkdtemp())
+    (d / "proj" / "src").mkdir(parents=True)
+    (d / "bin").mkdir()
+    (d / "proj" / "README.md").write_text("orig\n")
+    (d / "proj" / ".env").write_text("SECRET=1\n")
+    (d / "bin" / "codex").write_text(FAKE_CODEX)
+    (d / "bin" / "codex").chmod(0o755)
+    (d / "t.md").write_text("# TODO: t\nbackend: local\nwrite: src/\nmax-minutes: 1\n## Steps\n1. x\n")
+    for tamper, want_code in (("", 0), ("1", 3)):
+        env = dict(os.environ, PATH="%s%s%s" % (d / "bin", os.pathsep, os.environ["PATH"]), USE_CODEX_HOME=str(d / "runs"))
+        env.pop("FAKE_TAMPER", None)
+        if tamper:
+            env["FAKE_TAMPER"] = tamper
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "start", str(d / "t.md"), str(d / "proj")],
+                           env=env, capture_output=True, text=True, timeout=120)
+        readme = (d / "proj" / "README.md").read_text()
+        good = (r.returncode == want_code and (d / "proj" / "src" / "a.py").read_text() == "print(1)\n"
+                and readme == "orig\n" and (d / "proj" / ".env").read_text() == "SECRET=1\n"
+                and (("reverted-out-of-scope=['README.md']" in r.stdout) == bool(tamper)))
+        if not good:
+            fails += 1
+            print("local backend case tamper=%r FAILED (exit %s)\n%s%s" % (tamper, r.returncode, r.stdout, r.stderr))
+    shutil.rmtree(d, ignore_errors=True)
+    print("selftest_local: 2 end-to-end cases, %d failures" % fails)
+    return fails
 
 
 if __name__ == "__main__":

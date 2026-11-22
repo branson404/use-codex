@@ -4,13 +4,13 @@ A [Claude Code](https://claude.com/claude-code) skill that hands planned develop
 [OpenAI Codex](https://github.com/openai/codex) agent, so Claude spends its usage on planning and review
 instead of its own bash and edit calls.
 
-Claude writes one short TODO. `codex_run.py` runs `codex exec --json` for that TODO inside a locked-down Docker
-container and checks every command and file edit Codex makes against the TODO's allowlist. If Codex steps outside
+Claude writes one short TODO. `codex_run.py` runs `codex exec --json` for that TODO in a confined environment
+(a locked-down Docker container, or Codex's native sandbox on a scratch copy) and checks every command and file edit Codex makes against the TODO's allowlist. If Codex steps outside
 the plan, the container is killed, and Claude can steer the same session with `resume`. Claude then verifies the
 result itself.
 
 ```
-Claude: plan -> TODO.md ──> codex_run.py start ──> Docker container
+Claude: plan -> TODO.md ──> codex_run.py start ──> confined run (docker | local)
                                 │                     └─ codex exec --json (gpt-6.2 sol / astra)
                                 └─ live monitor: unlisted command / edit / tool? kill
 Claude: read summary, re-run acceptance checks, commit
@@ -18,10 +18,10 @@ Claude: read summary, re-run acceptance checks, commit
 
 ## Requirements
 
-- Linux with Docker (the user must be able to run `docker`)
-- [Codex CLI](https://github.com/openai/codex) on `PATH`, logged in (`codex login`)
+- **macOS or Linux** (Windows: use WSL2; native Windows is not supported)
+- **[Codex CLI](https://github.com/openai/codex) installed and logged in** (`codex login`). That is all the default setup needs.
 - Python 3.9+ (standard library only)
-- A container image whose architecture matches the host (the host's `codex` binaries are mounted in, default image `python:3.12-slim`)
+- Optional: Docker on Linux. If it is available the runner uses it for stronger isolation (see backends below).
 
 ## Install
 
@@ -57,27 +57,42 @@ Restart Claude Code. Then say "use codex to ..." or run `/use-codex`.
 
 `model: sol` / `astra` resolve to the newest listed `gpt-X-sol` / `gpt-X-astra` in `~/.codex/models_cache.json`.
 
-## What it enforces
+## Backends
 
-| Layer | Rule |
+`backend: auto` (the default) picks one per run. Override with `backend: docker` or `backend: local` in the TODO header.
+
+| | `docker` (auto on Linux with a working Docker) | `local` (auto on macOS, or Linux without Docker) |
+|---|---|---|
+| Where Codex runs | locked-down container (`--cap-drop ALL`, non-root, resource limits) | on your machine, inside Codex's own sandbox (`workspace-write`: Seatbelt on macOS, bwrap on Linux), never `danger-full-access` |
+| Project | mounted **read-only**; only `write:` paths are writable | **scratch copy** (no `.git`, dependency dirs or secret files); after the run only `write:` paths are copied back |
+| Out-of-scope edits | impossible (read-only mount) | detected by diff, **reverted** and reported as a violation |
+| Secrets | `.env`, `*.pem`, `*.key`, `.npmrc`, ... blanked | not copied into the scratch copy |
+| Login | your `~/.codex/auth.json` is copied to a short-lived run folder, deleted afterwards (a refreshed token is copied back; Codex rotates refresh tokens) | uses your normal Codex login in place, nothing copied |
+
+Both backends share the same live monitor:
+
+| Rule | Effect |
 |---|---|
-| Container | `--cap-drop ALL`, `no-new-privileges`, pids/memory/cpu limits, non-root, project mounted **read-only** |
-| Writes | only the `write:` paths are mounted read-write; `.env`, `*.pem`, `*.key`, `.npmrc`, ... are blanked |
-| Commands | read-only inspection plus the TODO's `run:` entries; `$(...)`, backticks, unlisted binaries, paths outside `/work` are violations |
+| Commands | read-only inspection plus the TODO's `run:` entries; `$(...)`, backticks, unlisted binaries and paths outside the project are violations |
 | Tools | MCP and web search are violations unless `web: yes` |
 | Budget | `max-commands`, `max-minutes`, and a stall timer (no events for 300 s) |
-| Credentials | your `~/.codex/auth.json` is copied into the run folder and deleted afterwards; a refreshed token is copied back (Codex rotates refresh tokens, so the host copy would otherwise go stale) |
 
 ## Limits (please read)
 
-- **The monitor is not a security boundary against a hostile model.** The container is. The monitor parses shell
-  text and is a policy and cost guard; unusual but legitimate commands may need a `run:` entry.
-- **Network stays on** (Codex needs its API). The monitor blocks `curl` and friends, but an allowlisted command can
-  still make network calls.
-- The run folder holds a short-lived copy of your Codex login, and the container user can read it. The monitor
-  blocks reads of it; the filesystem does not.
-- Tested only on **Linux/arm64** with **codex-cli 0.170** and `gpt-6.2-sol`. Event parsing follows Codex's
-  `--json` output; if it changes, the runner prints `WARN` instead of silently not policing.
+- **The monitor is not a security boundary against a hostile model.** The container (docker) or Codex's native sandbox
+  (local) is. The monitor parses shell text and is a policy and cost guard; unusual but legitimate commands may need a
+  `run:` entry.
+- The `local` backend is weaker than `docker`: it relies on Codex's own sandbox plus the scratch copy. Use `docker`
+  on Linux when you can.
+- `docker`: network stays on (Codex needs its API); the monitor blocks `curl` and friends, but an allowlisted command
+  can still make network calls. The run folder holds a short-lived copy of your login that the container user can
+  read; the monitor blocks reads of it, the filesystem does not.
+- **Tested:** `docker` backend live on Linux/arm64 with codex-cli 0.170 and `gpt-6.2-sol`. The `local` backend's
+  logic (scratch copy, diff, apply/revert, secret exclusion) is tested offline with a stand-in `codex` in CI on
+  Linux and macOS; a real Codex job through `local` on macOS has **not** been verified yet. On Linux hosts that block
+  user namespaces Codex's native sandbox cannot start, so use `docker` there.
+- Event parsing follows Codex's `--json` output; if it changes, the runner prints `WARN` instead of silently not
+  policing.
 - Using Codex costs Codex usage. Keep TODOs short and `effort` low; a tiny job still used tens of thousands of
   (mostly cached) input tokens.
 - Check the Codex CLI's current terms before running automation against your account.
@@ -85,8 +100,8 @@ Restart Claude Code. Then say "use codex to ..." or run `/use-codex`.
 ## Development
 
 ```bash
-python3 scripts/codex_run.py selftest          # offline: policy engine + monitor (also runs in CI)
-python3 scripts/codex_run.py start TODO.md PROJECT --probe   # verifies container confinement, no model call
+python3 scripts/codex_run.py selftest          # offline: policy engine, monitor, local backend (runs in CI on Linux + macOS)
+python3 scripts/codex_run.py start TODO.md PROJECT --probe   # docker backend: verifies confinement, no model call
 ```
 
 ## License
