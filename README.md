@@ -57,6 +57,29 @@ Restart Claude Code. Then say "use codex to ..." or run `/use-codex`.
 
 `model: sol` / `astra` resolve to the newest listed `gpt-X-sol` / `gpt-X-astra` in `~/.codex/models_cache.json`.
 
+## Does it save Claude usage?
+
+Honest answer: **only on large jobs.** Measured on 2026-11-22 with Claude Sonnet 5.5 (high effort) doing the same four
+tasks directly vs through this skill (one run per cell, tokens = a subagent's total, which includes about 49k of fixed
+baseline, so the differences are small but real):
+
+| Task (new code written) | Claude directly | Claude via use-codex | Difference | Codex input (cached) / output tokens |
+|---|---|---|---|---|
+| S, 0.7 KB | 49,212 | 54,474 | **+10.7%** | 84,084 (76,928) / 765 |
+| M, 3.6 KB | 51,043 | 55,885 | **+9.5%** | 87,826 (82,560) / 1,657 |
+| L, 8.5 KB | 53,950 | 56,304 | **+4.4%** | 217,895 (198,272) / 5,666 |
+| XL, 17 KB | 58,407 | 57,840 | **-1.0%** | 218,689 (200,064) / 7,096 |
+
+- Claude's tool calls went from 2-3 to 6-7 per job, and wall time from 9-54 s to 47-194 s.
+- What Claude has to *write* is what shrinks: the TODO stays about 1-4 KB while the code it replaces grows to 17 KB.
+  That is where the saving comes from, and why break-even is near 17 KB. Extrapolated from these four points (not
+  measured), a 50 KB job would save roughly 15%.
+- Quality was equal: every run passed its unit tests and an independent hidden check.
+- **Codex side:** each job used 82k-219k input tokens (about 91% cached) and 0.5k-7k output tokens, and moved the
+  Codex quota meters by 0-1 points of the 5-hour window and 0-1 of the weekly window. A fixed ~76k cached prompt
+  overhead per run means many tiny jobs are wasteful; batch work into fewer, larger TODOs.
+- Limits of this test: one run per cell, one model, tokens rather than dollars, Linux Docker backend only.
+
 ## Backends
 
 `backend: auto` (the default) picks one per run. Override with `backend: docker` or `backend: local` in the TODO header.

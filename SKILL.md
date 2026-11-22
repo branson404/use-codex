@@ -1,6 +1,6 @@
 ---
 name: use-codex
-description: Delegate a planned development or infra job to a Codex agent (gpt-6.2 sol/astra) running in a confined Docker container, so Claude spends its usage on planning and review instead of bash/edit tool calls. Claude writes one crisp TODO, a runner executes Codex against it and kills or steers it the moment it runs an unlisted command or touches an unlisted file. Use when the user says "use codex", "delegate to codex", "/use-codex", "save claude usage", or hands over a multi-step build/refactor/test-writing job. Skip for tiny edits (under ~3 tool calls).
+description: Delegate a planned development or infra job to a Codex agent (gpt-6.2 sol/astra) running in a confined Docker container, so Claude spends its usage on planning and review instead of bash/edit tool calls. Claude writes one crisp TODO, a runner executes Codex against it and kills or steers it the moment it runs an unlisted command or touches an unlisted file. Use when the user says "use codex", "delegate to codex", "/use-codex", "save claude usage", or hands over a multi-step build/refactor/test-writing job. Only worth it for big generation jobs (roughly 15 KB / 400+ lines of new code or many files): measured on small and medium jobs it costs Claude MORE tokens and 3-5x more time, so do those directly.
 ---
 
 # use-codex
@@ -8,7 +8,7 @@ description: Delegate a planned development or infra job to a Codex agent (gpt-6
 Claude plans and reviews. Codex does the typing. A runner enforces the plan.
 
 ## 0. Gate (10 seconds)
-- Tiny job (a one-line fix, a single read)? Do it yourself; Codex has startup cost.
+- Small/medium job (under roughly 15 KB / 400 lines of new code)? Do it yourself. Measured (Sonnet 5.5 high): delegating cost Claude +10% tokens on small, +4% on large, break-even at ~17 KB, and 3-5x the wall time. It pays off only above that, or when you want to move work onto Codex's quota.
 - `python3 ~/.claude/skills/use-codex/scripts/codex_run.py check TODO PROJECT` prints `login: present|MISSING`.
   If Codex answers `refresh token was revoked`, stop and tell the user to run `! codex login` (interactive; you cannot).
 - Only hard requirements: Codex CLI installed + logged in, macOS or Linux. `backend: auto` uses Docker when it works on Linux, else the

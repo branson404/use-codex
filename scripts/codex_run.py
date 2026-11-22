@@ -38,6 +38,24 @@ SECRET_RE = re.compile(r"\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_rsa.*|credentials
 
 
 # ---------------------------------------------------------------- TODO parsing
+def validate(cfg):
+    """TODO headers come from a model, so treat them as untrusted input."""
+    for w in cfg["write_list"]:
+        if os.path.isabs(w) or ".." in Path(w).parts:
+            sys.exit("write: entries must be relative paths inside the project: %s" % w)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]*", cfg["image"]):
+        sys.exit("invalid image name: %s" % cfg["image"])  # blocks `--privileged`-style flag injection
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", cfg["model"]):
+        sys.exit("invalid model: %s" % cfg["model"])
+    if cfg["effort"] not in ("low", "medium", "high", "xhigh", "max", "ultra"):
+        sys.exit("invalid effort: %s" % cfg["effort"])
+    for k in ("max-minutes", "max-commands", "stall-seconds"):
+        try:
+            float(cfg[k])
+        except ValueError:
+            sys.exit("%s must be a number" % k)
+
+
 def parse_todo(path):
     text = Path(path).read_text()
     cfg = dict(DEFAULTS)
@@ -50,6 +68,7 @@ def parse_todo(path):
     cfg["write_list"] = [w.strip() for w in cfg["write"].split(",") if w.strip()]
     cfg["run_list"] = [shlex.split(r) for r in (x.strip() for x in cfg["run"].split(",")) if r]
     cfg["text"] = text
+    validate(cfg)
     return cfg
 
 
@@ -489,6 +508,12 @@ def sync_back(project, stage, policy):
     applied, reverted = [], []
     for rel in sorted(set(old) | set(new)):
         a, b = old.get(rel), new.get(rel)
+        if b and b.is_symlink():  # never follow a symlink out of the scratch copy
+            b.unlink()
+            if a:
+                shutil.copy2(a, stage / rel)
+            reverted.append(rel)
+            continue
         if a and b and filecmp.cmp(a, b, shallow=False):
             continue
         if policy.writable(rel):
@@ -600,7 +625,9 @@ def execute(run_dir, meta, cfg, tail, probe=False):
 def new_run(cfg, todo_path, project):
     run_id = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
     run_dir = RUNS / run_id
-    run_dir.mkdir(parents=True)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    os.chmod(RUNS, 0o700)
+    run_dir.mkdir(mode=0o700)
     model = resolve_model(cfg["model"])
     shutil.copyfile(todo_path, run_dir / "TODO.md")
     meta = {"id": run_id, "container": "cx-" + run_id, "project": str(Path(project).resolve()), "model": model,
@@ -729,7 +756,8 @@ def selftest():
     if p.check_file_change([{"path": "/work/src/api/a.py", "kind": "update"}]) or not p.check_file_change([{"path": "/work/src/core.py", "kind": "update"}]):
         fails += 1
         print("file_change policy wrong")
-    log = tempfile.mktemp()
+    fd, log = tempfile.mkstemp()
+    os.close(fd)
     m = Monitor(p, dict(cfg), log)
     evs = [{"type": "thread.started", "thread_id": "t1"},
            {"type": "item.started", "item": {"id": "1", "type": "command_execution", "command": B("rg -n x src")}},
@@ -746,6 +774,13 @@ def selftest():
         fails += 1
         print("monitor state wrong", v, m.thread_id, m.done, m.tokens)
     os.unlink(log)
+    for badcfg in ({"write_list": ["../x"]}, {"write_list": ["/etc/"]}, {"image": "--privileged"}, {"effort": "turbo"}, {"model": "-x"}, {"max-minutes": "soon"}):
+        try:
+            validate({**DEFAULTS, "write_list": [], **badcfg})
+            fails += 1
+            print("validate() missed", badcfg)
+        except SystemExit:
+            pass
     fails += selftest_local()
     print("selftest: %d ok-cases, %d bad-cases, %d failures" % (len(ok), len(bad), fails))
     return 1 if fails else 0
@@ -764,6 +799,8 @@ ev({"type": "item.completed", "item": {"id": "1", "type": "file_change",
     "changes": [{"path": os.path.join(cwd, "src", "a.py"), "kind": "add"}]}})
 if os.environ.get("FAKE_TAMPER"):
     open(os.path.join(cwd, "README.md"), "w").write("tampered\\n")  # hidden: never reported in the stream
+if os.environ.get("FAKE_SYMLINK"):
+    os.symlink("/etc/hostname", os.path.join(cwd, "src", "link"))
 ev({"type": "item.completed", "item": {"id": "2", "type": "agent_message", "text": "DONE: ok"}})
 ev({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}})
 """
@@ -779,22 +816,23 @@ def selftest_local():
     (d / "bin" / "codex").write_text(FAKE_CODEX)
     (d / "bin" / "codex").chmod(0o755)
     (d / "t.md").write_text("# TODO: t\nbackend: local\nwrite: src/\nmax-minutes: 1\n## Steps\n1. x\n")
-    for tamper, want_code in (("", 0), ("1", 3)):
+    for var, want_code, rev in ((None, 0, None), ("FAKE_TAMPER", 3, "README.md"), ("FAKE_SYMLINK", 3, "src/link")):
         env = dict(os.environ, PATH="%s%s%s" % (d / "bin", os.pathsep, os.environ["PATH"]), USE_CODEX_HOME=str(d / "runs"))
         env.pop("FAKE_TAMPER", None)
-        if tamper:
-            env["FAKE_TAMPER"] = tamper
+        env.pop("FAKE_SYMLINK", None)
+        if var:
+            env[var] = "1"
         r = subprocess.run([sys.executable, os.path.abspath(__file__), "start", str(d / "t.md"), str(d / "proj")],
                            env=env, capture_output=True, text=True, timeout=120)
-        readme = (d / "proj" / "README.md").read_text()
+        want = "reverted-out-of-scope=['%s']" % rev if rev else "reverted-out-of-scope=-"
         good = (r.returncode == want_code and (d / "proj" / "src" / "a.py").read_text() == "print(1)\n"
-                and readme == "orig\n" and (d / "proj" / ".env").read_text() == "SECRET=1\n"
-                and (("reverted-out-of-scope=['README.md']" in r.stdout) == bool(tamper)))
+                and (d / "proj" / "README.md").read_text() == "orig\n" and (d / "proj" / ".env").read_text() == "SECRET=1\n"
+                and not os.path.lexists(d / "proj" / "src" / "link") and want in r.stdout)
         if not good:
             fails += 1
-            print("local backend case tamper=%r FAILED (exit %s)\n%s%s" % (tamper, r.returncode, r.stdout, r.stderr))
+            print("local backend case %s FAILED (exit %s)\n%s%s" % (var, r.returncode, r.stdout, r.stderr))
     shutil.rmtree(d, ignore_errors=True)
-    print("selftest_local: 2 end-to-end cases, %d failures" % fails)
+    print("selftest_local: 3 end-to-end cases, %d failures" % fails)
     return fails
 
 
