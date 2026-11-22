@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# private session handoff, never publish
+HANDOFF.md
