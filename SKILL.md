@@ -22,6 +22,8 @@ Copy `templates/TODO.template.md`. Rules:
 - `run:` lists the only non-read-only commands it may use (tests, linters, builds). Anything else = violation.
 - Forbid git commits, installs, network. Claude commits after review.
 - Put acceptance commands in `## Acceptance`; you re-run them yourself afterwards.
+- Order the checks sensibly: never require a green test run at a step that only a later step makes green (a real run blocked on exactly that).
+- Leave `backend:` unset. `auto` picks Docker where it works; set `local` only on macOS. Docker's default image has no project dependencies: build or name an image that has them via `image:`.
 - Do not paste large code or write essays. Short, literal, checkable.
 
 Model/effort: `sol` + `high` default. `astra` only for hard architecture or gnarly debugging. `effort: low` for mechanical edits,
